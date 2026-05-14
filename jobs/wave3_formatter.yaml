@@ -95,7 +95,7 @@ output:
   # log: /tmp/custom.log
   # status: /tmp/custom_status.json
   # pid: /tmp/custom.pid
-  # adapter_dir: /fast/ssd/adapter
+  adapter_dir: ~/lora_training/adapters/qwen3-formatter-lora-wave3-gpu
   # checkpoint_dir: /fast/ssd/checkpoints
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -122,7 +122,7 @@ post_training:
   # POSTs the new GGUF to the running llama.cpp server without a restart.
   server:
     base_url:       http://localhost:8080
-    lora_endpoint:  /lora
+    lora_endpoint:  /lora-adapters
     chat_endpoint:  /v1/chat/completions
     adapter_id:     0
     scale:          1.0

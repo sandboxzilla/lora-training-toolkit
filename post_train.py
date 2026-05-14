@@ -307,7 +307,7 @@ if not args.skip_deploy:
             sys.exit(1)
 
         base_url      = _get(cfg, "post_training", "server", "base_url", required=True).rstrip("/")
-        lora_endpoint = _get(cfg, "post_training", "server", "lora_endpoint", default="/lora")
+        lora_endpoint = _get(cfg, "post_training", "server", "lora_endpoint", default="/lora-adapters")
         adapter_id    = _get(cfg, "post_training", "server", "adapter_id", default=0)
         scale         = _get(cfg, "post_training", "server", "scale", default=1.0)
         timeout_s     = _get(cfg, "post_training", "server", "timeout_s", default=60)
