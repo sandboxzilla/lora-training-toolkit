@@ -1,0 +1,276 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# LoRA Training Job Config — GW-COR-006 Wave 3
+# Qwen3-8B document formatter adapter
+#
+# Usage:
+#   python3 lora_train.py --config jobs/wave3_formatter.yaml
+#   python3 lora_train.py --config jobs/wave3_formatter.yaml --smoke
+#   python3 lora_train.py --config jobs/wave3_formatter.yaml --resume
+#
+# Artifact tree (all derived from output.base_dir + job.name + run_id):
+#
+#   ~/lora_training/wave3_formatter/
+#   ├── data/                              ← dataset JSONL files
+#   └── runs/
+#       ├── r001/
+#       │   ├── wave3_formatter.log        ← training output
+#       │   ├── wave3_formatter_status.json
+#       │   ├── wave3_formatter_guardian.log
+#       │   ├── wave3_formatter.pid
+#       │   ├── config.yaml                ← config snapshot for reproducibility
+#       │   ├── adapter/                   ← final saved adapter
+#       │   └── checkpoints/
+#       │       ├── ep1_step100/
+#       │       └── ...
+#       └── r002/  ...
+# ──────────────────────────────────────────────────────────────────────────────
+
+job:
+  name: wave3_formatter
+  description: >
+    Qwen3-8B LoRA fine-tune — document formatter role, Wave 3 GPU run.
+    Produces the qwen3-formatter-lora adapter for AgentHub document formatting tasks.
+  labels:
+    - lora
+    - qwen3-8b
+    - document-formatter
+    - gw-cor-006
+    - wave3
+  agent_context: |
+    Training runs on ub02 AMD Radeon 780M (gfx1103, RDNA3).
+    Active venv: ~/rocm72_env (torch-2.11.0a0+git70d99e9, PYTORCH_ROCM_ARCH=gfx1103).
+    AMD_SERIALIZE_KERNEL=3 is MANDATORY — without it, GPU errors surface in C++ destructors
+    and call std::terminate() rather than raising Python exceptions.
+    Guardian: ~/wave3_guardian.sh (tmux session 'wave3', window 0).
+    Dataset: ~/lora_training/wave3_formatter/data/ (agenthub_domain corpus, 1286 examples).
+    After completion:
+      1. Gate 7: load adapter, run document formatting inference, validate output
+      2. Convert to GGUF: python3 ~/src/llama.cpp/convert_lora_to_gguf.py
+      3. Hot-swap: POST /lora to port 8080
+      4. Restart inference: systemctl start llama-8b llama-4b
+    PM log: docs/(cor)core_alm_hierarchy/(am)ai_agent_management/
+            project_governance/gw_cor_006_lora_training_wave2/o4902_gw_cor_006_pm_log.md
+
+hardware:
+  driver: amd_rocm          # options: amd_rocm | nvidia_cuda | cpu
+  lm_head_cpu_bridge: true  # keep lm_head on CPU — saves ~1.16GB VRAM on gfx1103
+                            # set false on NVIDIA or when VRAM is not constrained
+  amd_rocm:
+    no_hipblaslt: true
+    rocblas_tensile_libpath: /opt/rocm-7.2.2/lib/rocblas/library
+    pytorch_cuda_alloc_conf: expandable_segments:True
+    serialize_kernel: 3           # MANDATORY on gfx1103
+    transformers_offline: true
+
+model:
+  path: ~/qwen3-8b-hf-method4
+  attn_implementation: eager      # required: no flash attention on gfx1103
+
+lora:
+  r: 8
+  alpha: 16
+  target_modules: [q_proj, k_proj, v_proj, o_proj]
+  dropout: 0.0
+  bias: none
+  task_type: CAUSAL_LM
+
+training:
+  epochs: 3
+  grad_accum: 4
+  max_seq_len: 128
+  seed: 42
+  optimizer: adafactor
+
+data:
+  # Default: {base_dir}/{job_name}/data/*.jsonl
+  # Override with explicit dir if data lives elsewhere:
+  # dir: ~/some/other/path
+  pattern: "*.jsonl"
+
+output:
+  base_dir: ~/lora_training         # root; artifacts at {base_dir}/{job_name}/runs/{run_id}/
+  run_id: auto                      # 'auto' = next r001/r002/...; or set explicitly e.g. 'r003'
+  checkpoint_every_steps: 100
+  # Optional per-artifact overrides (rarely needed — defaults are derived from base_dir):
+  # log: /tmp/custom.log
+  # status: /tmp/custom_status.json
+  # pid: /tmp/custom.pid
+  # adapter_dir: /fast/ssd/adapter
+  # checkpoint_dir: /fast/ssd/checkpoints
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Post-training pipeline — run after training completes:
+#   python3 post_train.py --config jobs/wave3_formatter.yaml
+#   python3 post_train.py --config jobs/wave3_formatter.yaml --skip-gguf
+#   python3 post_train.py --config jobs/wave3_formatter.yaml --skip-gguf --skip-deploy
+# ──────────────────────────────────────────────────────────────────────────────
+
+post_training:
+
+  # ── Step 1: GGUF conversion ─────────────────────────────────────────────────
+  # Converts the HuggingFace adapter to GGUF for use with llama.cpp.
+  # Requires: llama_cpp_dir/convert_lora_to_gguf.py and a venv with transformers.
+  gguf:
+    llama_cpp_dir:  ~/llama.cpp
+    base_model:     ~/qwen3-8b-hf-method4
+    outtype:        f16
+    output_dir:     ~/models/lora/adapters
+    venv:           ~/rocm72_env
+    python:         python3
+
+  # ── Step 2: Hot-swap deployment ─────────────────────────────────────────────
+  # POSTs the new GGUF to the running llama.cpp server without a restart.
+  server:
+    base_url:       http://localhost:8080
+    lora_endpoint:  /lora
+    chat_endpoint:  /v1/chat/completions
+    adapter_id:     0
+    scale:          1.0
+    timeout_s:      120
+
+  # ── Step 3: Inference tests ──────────────────────────────────────────────────
+  # Tests are run in order; all must pass for verdict=PASS (exit 0).
+  # expect_pattern is a Python regex matched against the full response text.
+  tests:
+
+    # ── T01: Minimal flat-field formatting ───────────────────────────────────
+    # Simplest case: one-line key/value pair with no structure.
+    - name: t01_flat_field_simple
+      system: >
+        You are a document formatter for AgentHub.
+        Format the given raw text into a clean Markdown key-value block.
+        Output only the formatted result.
+      user: "task_id=5 assigned_to=claude status=done created=2026-05-14"
+      expect_pattern: "(?i)(task|assigned|status|done|2026)"
+      max_tokens: 128
+      temperature: 0.0
+
+    # ── T02: Multi-field structured record ───────────────────────────────────
+    # Medium: several fields with mixed types, expects a table or list output.
+    - name: t02_structured_record_table
+      system: >
+        You are a document formatter for AgentHub.
+        Format the following record as a Markdown table with columns: Field, Value.
+        Output only the table.
+      user: |
+        job_name: wave3_formatter
+        model: Qwen3-8B
+        adapter_type: LoRA
+        rank: 8
+        alpha: 16
+        epochs: 3
+        steps: 966
+        final_loss: 7.87
+        status: COMPLETE
+        completed_at: 2026-05-14T14:24:26Z
+      expect_pattern: "(?i)(job|model|rank|loss|complete|\\|)"
+      max_tokens: 256
+      temperature: 0.0
+
+    # ── T03: Formal section with header and body ──────────────────────────────
+    # Medium-complex: prose input, expects titled section with bullet points.
+    - name: t03_section_with_header_bullets
+      system: >
+        You are a document formatter for AgentHub.
+        Reformat the given text as a Markdown section with:
+          - A level-2 heading (## Title)
+          - A short introductory sentence
+          - A bullet list of the key points
+        Output only the formatted section.
+      user: |
+        The training run completed successfully after 966 optimizer steps
+        spanning 3 epochs. The adapter achieved a final loss of 7.87. No GPU
+        errors occurred and no restarts were needed. The adapter has been saved
+        to the configured output directory and is ready for GGUF conversion and
+        deployment to the inference server.
+      expect_pattern: "(?i)(##|training|adapter|loss|epoch|bullet|\\-\\s)"
+      max_tokens: 256
+      temperature: 0.0
+
+    # ── T04: AHC document header block ───────────────────────────────────────
+    # Domain-specific: AgentHub Coordinate header as a two-column Markdown table.
+    - name: t04_ahc_header_block
+      system: >
+        You are a document formatter for AgentHub.
+        Format the following metadata as an AgentHub AHC document header:
+        a Markdown table with two columns (Field | Value) and two rows per table
+        section, covering document identity and governance fields.
+        Output only the formatted table.
+      user: |
+        Document ID: o4902
+        Title: GW-COR-006 PM Log
+        Status: ACTIVE
+        Author: Project Lead
+        Reviewer: Sentinel Architect
+        Program: ah_g01
+        Project: _ah_opg01
+        Version: 1.3
+        Date: 2026-05-14
+        PDC: COR.AM
+      expect_pattern: "(?i)(\\|.*field.*\\|.*value|document|status|active|version|\\|)"
+      max_tokens: 256
+      temperature: 0.0
+
+    # ── T05: Multi-section report (long, complex) ─────────────────────────────
+    # Complex: two distinct data blocks, expects two headings and structured output.
+    - name: t05_multi_section_report
+      system: >
+        You are a document formatter for AgentHub.
+        Format the following training summary as a two-section Markdown report:
+          Section 1 (## Training Summary): key training metrics as a table
+          Section 2 (## Issues): issues list as a numbered list; if none, write "None."
+        Output only the formatted report.
+      user: |
+        Training job: wave3_formatter
+        Model: Qwen3-8B with LoRA r=8 alpha=16
+        Dataset: 1286 examples, 3 epochs
+        Optimizer: adafactor, grad_accum=4, max_seq_len=128
+        Steps completed: 966 / 964 (extra steps due to dataset rounding)
+        Final loss: 7.8699
+        VRAM peak: 14588 MB
+        Duration: ~30 hours
+        Restarts: 0
+        Checkpoints saved: 16
+
+        Issues encountered:
+        Status JSON showed step=0 for first hour due to cached bash function.
+        Fixed by cron-patching the status JSON every 2 minutes.
+      expect_pattern: "(?i)(##\\s*training|##\\s*issue|loss|epoch|step|none|fixed)"
+      max_tokens: 512
+      temperature: 0.0
+
+    # ── T06: Paragraph prose reformat ────────────────────────────────────────
+    # Tests prose cleanup: loose notes → readable paragraph with no bullets.
+    - name: t06_prose_paragraph_cleanup
+      system: >
+        You are a document formatter for AgentHub.
+        Rewrite the following rough notes as a single, clean, professional
+        paragraph suitable for a project status report. No headings, no bullets.
+        Output only the paragraph.
+      user: |
+        wave3 done. loss ok 7.87. no crashes whole run. guardian worked fine.
+        adapter at ~/lora_training/adapters/qwen3-formatter-lora-wave3-gpu
+        next: gguf convert then hot-swap then test. also create github repo for
+        training scripts.
+      expect_pattern: "(?i)(training|adapter|completed|loss|convert|inference)"
+      max_tokens: 256
+      temperature: 0.2
+
+    # ── T07: Long changelog / version history table ───────────────────────────
+    # Long and structured: multi-row version history table.
+    - name: t07_version_history_table
+      system: >
+        You are a document formatter for AgentHub.
+        Format the following version history entries as a Markdown table with
+        columns: Version | Date | Author | Status | Notes.
+        Output only the table.
+      user: |
+        v1.0, 2026-03-17, Project Lead, Superseded, Initial creation
+        v1.1, 2026-03-17, Claude Code, Superseded, Added agent bus check
+        v1.2, 2026-04-05, Claude Code, Superseded, Updated dispatch table
+        v1.3, 2026-05-01, Claude Code, Superseded, Added DocCore RAG-first rule
+        v1.4, 2026-05-01, Claude Code, Active, Stripped to bootstrap-only
+        v2.0, 2026-05-12, Codex, Active, Rebuilt as concise operating contract
+      expect_pattern: "(?i)(\\|.*version|1\\.0|2\\.0|active|superseded)"
+      max_tokens: 512
+      temperature: 0.0
