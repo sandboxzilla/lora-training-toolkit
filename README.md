@@ -1,8 +1,7 @@
-# LoRA Training — User Manual
+# LoRA Training Toolkit
 
-**Script:** `lora_train.py`
-**Location:** `backend/scripts/ub02/lora_training/`
-**Version:** 1.0 — 2026-05-14
+**Scripts:** `lora_train.py`, `post_train.py`
+**Version:** 1.1 — 2026-05-14
 
 ---
 
@@ -12,7 +11,7 @@
 2. [Directory Contents](#2-directory-contents)
 3. [Prerequisites](#3-prerequisites)
 4. [Quick Start](#4-quick-start)
-5. [Command-Line Reference](#5-command-line-reference)
+5. [Command-Line Reference — lora_train.py](#5-command-line-reference--lora_trainpy)
 6. [Config File Reference](#6-config-file-reference)
    - 6.1. [job](#61-job)
    - 6.2. [hardware](#62-hardware)
@@ -30,10 +29,13 @@
 10. [Checkpoint and Resume](#10-checkpoint-and-resume)
 11. [Smoke Testing](#11-smoke-testing)
 12. [Monitoring Training Progress](#12-monitoring-training-progress)
-13. [Post-Training Steps](#13-post-training-steps)
-    - 13.1. [Gate 7 — Inference Validation](#131-gate-7--inference-validation)
-    - 13.2. [GGUF Conversion](#132-gguf-conversion)
-    - 13.3. [Adapter Deployment](#133-adapter-deployment)
+13. [Post-Training Pipeline — post_train.py](#13-post-training-pipeline--post_trainpy)
+    - 13.1. [Overview](#131-overview)
+    - 13.2. [Command-Line Reference — post_train.py](#132-command-line-reference--post_trainpy)
+    - 13.3. [Step 1: GGUF Conversion](#133-step-1-gguf-conversion)
+    - 13.4. [Step 2: Hot-Swap Deployment](#134-step-2-hot-swap-deployment)
+    - 13.5. [Step 3: Inference Tests](#135-step-3-inference-tests)
+    - 13.6. [Manual Steps (without post_train.py)](#136-manual-steps-without-post_trainpy)
 14. [Guardian Integration](#14-guardian-integration)
 15. [Exit Codes](#15-exit-codes)
 16. [Troubleshooting](#16-troubleshooting)
@@ -77,9 +79,8 @@ All files live under `backend/scripts/ub02/lora_training/`.
 
 | File | Description |
 |------|-------------|
-| `lora_train.py` | **Main training script (this tool).** Config-driven, hardware-abstracted, checkpoint-resumable. All new training jobs should use this script. |
-| `train_lora.py` | Earlier launcher targeting cloud GPU environments with the unsloth library. Not config-driven. Retained for reference. |
-| `train_lora_rocm.py` | Earlier AMD ROCm training script using `device_map="auto"` to split layers across iGPU and CPU RAM. Retained for reference. |
+| `lora_train.py` | **Training script.** Config-driven, hardware-abstracted, checkpoint-resumable. Reads a YAML job config; all paths and hyperparameters defined there. |
+| `post_train.py` | **Post-training pipeline.** Config-driven. Reads the same YAML job config and runs three sequential steps: GGUF conversion → hot-swap deployment → inference validation tests. |
 
 ### 2.2. Dataset Builders
 
@@ -857,69 +858,134 @@ process liveness instead.
 
 ---
 
-## 13. Post-Training Steps
+## 13. Post-Training Pipeline — post_train.py
 
-### 13.1. Gate 7 — Inference Validation
+### 13.1. Overview
 
-After training completes, validate the adapter before converting or deploying it.
+`post_train.py` automates the three steps that follow a completed training run. It reads
+the same YAML job config as `lora_train.py` and derives all paths from it.
 
-Load the final adapter and run a representative inference task:
-
-```python
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from peft import PeftModel
-import torch
-
-model_path   = "/path/to/base-model"        # same model.path from the job config
-adapter_path = "{run_dir}/adapter"           # final adapter directory
-
-tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-base      = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.float16,
-                                                  trust_remote_code=True)
-model     = PeftModel.from_pretrained(base, adapter_path)
-model.eval()
-
-prompt = tokenizer.apply_chat_template(
-    [{"role": "user", "content": "Your test prompt here"}],
-    tokenize=False, add_generation_prompt=True
-)
-inputs = tokenizer(prompt, return_tensors="pt")
-with torch.no_grad():
-    out = model.generate(**inputs, max_new_tokens=256)
-print(tokenizer.decode(out[0], skip_special_tokens=True))
+```
+Step 1 — GGUF conversion   : convert HF adapter → GGUF for llama.cpp
+Step 2 — Hot-swap deploy   : POST new GGUF to the running llama.cpp server
+Step 3 — Inference tests   : run the test suite defined under post_training.tests
 ```
 
-Validate that the output:
-- Is grammatically coherent.
-- Follows the expected format for your use case.
-- Does not regress on baseline capability.
+All three steps must pass for a verdict of `PASS` (exit 0). A JSON report is written
+to `{run_dir}/{job_name}_post_train_report.json`.
 
-### 13.2. GGUF Conversion
+### 13.2. Command-Line Reference — post_train.py
 
-Convert the adapter to GGUF format for use with llama.cpp:
+```
+python3 post_train.py --config <job.yaml> [options]
+
+Options:
+  --config FILE        Path to the YAML job config (required)
+  --run-id ID          Run directory to use (e.g. r003); default: latest run with an adapter/
+  --skip-gguf          Skip Step 1 — GGUF conversion
+  --skip-deploy        Skip Step 2 — hot-swap deploy
+  --skip-tests         Skip Step 3 — inference tests
+  --dry-run            Print what would be done without executing
+  -h, --help, -?       Show this help and exit
+
+Exit codes:
+  0    All steps passed
+  1    Setup or configuration error
+  2    One or more inference tests failed
+```
+
+### 13.3. Step 1: GGUF Conversion
+
+Configured under `post_training.gguf` in the job YAML:
+
+```yaml
+post_training:
+  gguf:
+    llama_cpp_dir:  ~/llama.cpp
+    base_model:     ~/path/to/base-model
+    outtype:        f16          # f16 or q4_k_m
+    output_dir:     ~/models/lora/adapters
+    venv:           ~/my_venv    # venv with transformers installed
+    python:         python3
+```
+
+The script activates the venv and runs `convert_lora_to_gguf.py` from `llama_cpp_dir`.
+Output filename: `{job_name}-{outtype}.gguf` in `output_dir`.
+
+To run conversion only:
 
 ```bash
-python3 /path/to/llama.cpp/convert_lora_to_gguf.py \
+python3 post_train.py --config jobs/my_job.yaml --skip-deploy --skip-tests
+```
+
+### 13.4. Step 2: Hot-Swap Deployment
+
+Configured under `post_training.server`:
+
+```yaml
+post_training:
+  server:
+    base_url:       http://localhost:8080
+    lora_endpoint:  /lora-adapters   # llama.cpp hot-swap endpoint
+    chat_endpoint:  /v1/chat/completions
+    adapter_id:     0
+    scale:          1.0
+    timeout_s:      120
+```
+
+POSTs the new GGUF path to the running server without requiring a restart:
+
+```bash
+# Equivalent manual command
+curl -s -X POST http://localhost:8080/lora-adapters \
+  -H "Content-Type: application/json" \
+  -d '[{"id":0,"path":"/path/to/my_adapter.gguf","scale":1.0}]'
+```
+
+To deploy only (adapter already converted):
+
+```bash
+python3 post_train.py --config jobs/my_job.yaml --skip-gguf --skip-tests
+```
+
+### 13.5. Step 3: Inference Tests
+
+Tests are defined as a list under `post_training.tests`. Each test sends a system+user
+prompt to the chat endpoint and matches the response against a Python regex:
+
+```yaml
+post_training:
+  tests:
+    - name: t01_basic_check
+      system: "You are a helpful assistant."
+      user: "Summarize: status=done, steps=966"
+      expect_pattern: "(?i)(done|steps|966)"
+      max_tokens: 128
+      temperature: 0.0
+```
+
+All tests must match for a PASS verdict. The report records each test result individually.
+
+### 13.6. Manual Steps (without post_train.py)
+
+If running steps manually:
+
+```bash
+# Step 1: GGUF conversion
+source ~/my_venv/bin/activate
+python3 ~/llama.cpp/convert_lora_to_gguf.py \
+    /path/to/adapter \
     --base /path/to/base-model \
-    --lora {run_dir}/adapter \
-    --outfile /path/to/output/my_adapter.gguf
-```
+    --outfile /path/to/output/my_adapter-f16.gguf \
+    --outtype f16
 
-### 13.3. Adapter Deployment
+# Step 2: Hot-swap
+curl -s -X POST http://localhost:8080/lora-adapters \
+  -H "Content-Type: application/json" \
+  -d '[{"id":0,"path":"/path/to/output/my_adapter-f16.gguf","scale":1.0}]'
 
-Hot-swap the adapter into a running llama.cpp server:
-
-```bash
-# Copy GGUF to the server's adapter directory
-cp /path/to/output/my_adapter.gguf /path/to/server/adapters/
-
-# Hot-swap via API (does not require server restart)
-curl -X POST http://<server-host>:<port>/lora \
-  -H 'Content-Type: application/json' \
-  -d '{"lora_adapters": [{"id": 1, "path": "/path/to/server/adapters/my_adapter.gguf", "scale": 1.0}]}'
-
-# Restart inference services if hot-swap is not sufficient
-systemctl restart <inference-service-name>
+# Step 3: Verify adapter loaded
+curl -s http://localhost:8080/lora-adapters
 ```
 
 ---
