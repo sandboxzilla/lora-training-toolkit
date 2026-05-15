@@ -8,7 +8,7 @@
 ## Table of Contents
 
 1. [Overview](#1-overview)
-2. [Directory Contents](#2-directory-contents)
+2. [Repository Contents](#2-repository-contents)
 3. [Prerequisites](#3-prerequisites)
 4. [Quick Start](#4-quick-start)
 5. [Command-Line Reference — lora_train.py](#5-command-line-reference--lora_trainpy)
@@ -71,71 +71,14 @@ Key capabilities:
 
 ---
 
-## 2. Directory Contents
-
-All files live under `backend/scripts/ub02/lora_training/`.
-
-### 2.1. Training Scripts
+## 2. Repository Contents
 
 | File | Description |
 |------|-------------|
-| `lora_train.py` | **Training script.** Config-driven, hardware-abstracted, checkpoint-resumable. Reads a YAML job config; all paths and hyperparameters defined there. |
+| `lora_train.py` | **Training script.** Config-driven, hardware-abstracted, checkpoint-resumable. Reads a YAML job config; all paths and hyperparameters are defined there. |
 | `post_train.py` | **Post-training pipeline.** Config-driven. Reads the same YAML job config and runs three sequential steps: GGUF conversion → hot-swap deployment → inference validation tests. |
-
-### 2.2. Dataset Builders
-
-Each `build_*.py` script produces one or more JSONL dataset files and a companion manifest.
-All v2 builders (`*_ar01_*`, `*_cr01_*`, `*_dr01_v2_*`, `*_tr01_*`, `*_rt01_*`) retrieve
-governance rules from DocCore at build time so no project-specific constraints are
-hardcoded in the training examples.
-
-| File | Adapter | Output |
-|------|---------|--------|
-| `build_dataset.py` | Original monolithic corpus | `dataset.jsonl` |
-| `build_wave1_datasets.py` | LRA-CR01, LRA-DR01 (synthetic) | Generates examples via local llama.cpp server |
-| `build_ar01_dataset.py` | LRA-AR01 Architecture Reviewer | `arch_reviewer_dataset.jsonl` |
-| `build_cr01_dataset.py` | LRA-CR01 Code Reviewer | `code_reviewer_dataset.jsonl` |
-| `build_dr01_dataset.py` | LRA-DR01 Document Reviewer (v1) | `doc_reviewer_dataset.jsonl` |
-| `build_dr01_dataset_v2.py` | LRA-DR01 Document Reviewer (v2) | Fully DocCore-driven; no hardcoded rules |
-| `build_tr01_dataset.py` | LRA-TR01 Test Reviewer | `test_reviewer_dataset.jsonl` |
-| `build_rt01_dataset.py` | LRA-RT01 Router Adapter | `router_adapter_dataset.jsonl` |
-| `build_r01_dataset.py` | LRA-R01 RAG Synthesis Adapter | `rag_synthesis_dataset.jsonl` |
-| `build_r01_dataset_live.py` | LRA-R01 (live builder) | Reads directly from live `doccore_section_embeddings` rows |
-
-### 2.3. Supporting Scripts
-
-| File | Description |
-|------|-------------|
-| `retriever_client.py` | Shared DocCore retrieval client imported by all v2 dataset builders. Abstracts the `/retrieve` API call so builders stay DRY. |
-| `pipeline.sh` | End-to-end shell pipeline: GGUF conversion → adapter deployment → smoke test → Wave 1 adapter builds (when datasets are present). |
-| `monitor_r01.sh` | Polling monitor for the R01 RAG Synthesis adapter training run. Logs progress and alerts on stalls. |
-| `r01_monitor_pm2.config.cjs` | PM2 process manager config for running `monitor_r01.sh` as a managed background process. |
-
-### 2.4. Job Configs
-
-| File | Description |
-|------|-------------|
-| `jobs/wave3_formatter.yaml` | Wave 3 Qwen3-8B document formatter job config. Fully annotated reference config for AMD ROCm training. |
-
-### 2.5. Datasets and Manifests
-
-Pre-built JSONL files and their companion markdown manifests (source stats, sample pairs):
-
-| Dataset | Manifest | Adapter |
-|---------|----------|---------|
-| `dataset.jsonl` | `manifest.md` | Original monolithic |
-| `arch_reviewer_dataset.jsonl` | `arch_reviewer_manifest.md` | LRA-AR01 |
-| `code_reviewer_dataset.jsonl` | `code_reviewer_manifest.md` | LRA-CR01 |
-| `doc_reviewer_dataset.jsonl` | `doc_reviewer_manifest.md` | LRA-DR01 |
-| `router_adapter_dataset.jsonl` | `router_adapter_manifest.md` | LRA-RT01 |
-| `test_reviewer_dataset.jsonl` | `test_reviewer_manifest.md` | LRA-TR01 |
-
-### 2.6. Documentation
-
-| File | Description |
-|------|-------------|
-| `USER_MANUAL.md` | This manual. |
-| `adapter_strategy.md` | LoRA adapter ecosystem strategy and roadmap: which adapters are planned, their roles, and the overall training wave plan. |
+| `jobs/example_job.yaml` | **Fully annotated example job config.** Use `--build` to generate a config for a new adapter, or copy and edit this file directly. |
+| `README.md` | This file. |
 
 ---
 
